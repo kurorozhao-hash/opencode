@@ -275,6 +275,16 @@ export const Info = Schema.Struct({
     Schema.Struct({
       disable_paste_summary: Schema.optional(Schema.Boolean),
       batch_tool: Schema.optional(Schema.Boolean).annotate({ description: "Enable the batch tool" }),
+      session_logger: Schema.optional(
+        Schema.Struct({
+          enabled: Schema.optional(Schema.Boolean).annotate({
+            description: "Enable session event logging to local JSONL files (default: true)",
+          }),
+          directory: Schema.optional(Schema.String).annotate({
+            description: "Directory path used to store session logger JSONL files",
+          }),
+        }),
+      ),
       openTelemetry: Schema.optional(Schema.Boolean).annotate({
         description: "Enable OpenTelemetry spans for AI SDK calls (using the 'experimental_telemetry' flag)",
       }),
