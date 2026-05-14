@@ -7,4 +7,20 @@
     "github-triage": false,
     "github-pr-search": false,
   },
+  "plugin": [
+    [
+      "file:///Users/yangzhao/08_opensrc/opencode/packages/opencode/src/plugin/event-logger.ts",
+      {
+        "level": "DEBUG",
+        "output": {
+          "directory": "/Users/yangzhao/08_opensrc/opencode/.opencode/logs/llm-event-logger",
+          "format": "json",
+        },
+        "retention": {
+          "days": 30,
+          "maxSizeMB": 100,
+        },
+      },
+    ],
+  ],
 }

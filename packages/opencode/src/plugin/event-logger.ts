@@ -405,6 +405,7 @@ export const EventLoggerPlugin = async (
     async "experimental.chat.messages.transform"(input, output) {
       await logEvent("experimental.chat.messages.transform", "hook", {
         messageCount: output.messages?.length,
+        messages: output.messages,
       })
     },
 
@@ -416,6 +417,7 @@ export const EventLoggerPlugin = async (
         sessionID: input.sessionID,
         model: input.model?.id,
         systemLength: output.system?.length,
+        system: output.system,
       }, input.sessionID)
     },
 
@@ -427,6 +429,8 @@ export const EventLoggerPlugin = async (
         sessionID: input.sessionID,
         contextCount: output.context?.length,
         hasCustomPrompt: !!output.prompt,
+        context: output.context,
+        prompt: output.prompt,
       }, input.sessionID)
     },
 
@@ -451,6 +455,7 @@ export const EventLoggerPlugin = async (
         messageID: input.messageID,
         partID: input.partID,
         textLength: output.text?.length,
+        text: output.text,
       }, input.sessionID)
     },
   }
