@@ -1,11 +1,63 @@
 import type { Hooks, PluginInput } from "@opencode-ai/plugin"
-import * as Log from "@opencode-ai/core/util/log"
-import { Global } from "@opencode-ai/core/global"
 import fs from "fs/promises"
 import path from "path"
+import os from "os"
 import { readdirSync, statSync } from "fs"
 
-const log = Log.create({ service: "plugin.event-logger" })
+/** Same layout as Global.Path.data when XDG_DATA_HOME is unset (~/.local/share/opencode). */
+function defaultOpencodeDataDir() {
+  const dataHome = process.env.XDG_DATA_HOME?.trim()
+  return path.join(dataHome || path.join(os.homedir(), ".local", "share"), "opencode")
+}
+
+const pluginLog = {
+  info(message: string, data?: Record<string, unknown>) {
+    console.error(`[opencode:event-logger] ${message}`, data ?? "")
+  },
+  error(message: string, data?: Record<string, unknown>) {
+    console.error(`[opencode:event-logger] ${message}`, data ?? "")
+  },
+}
+
+const GLOBAL_SESSION_FILE_KEY = "global"
+
+function trimSessionId(value: unknown): string | undefined {
+  if (typeof value !== "string") return
+  const t = value.trim()
+  return t || undefined
+}
+
+function extractSessionIdFromProperties(properties: unknown): string | undefined {
+  if (!properties || typeof properties !== "object") return
+  const p = properties as Record<string, unknown>
+  const top =
+    trimSessionId(p.sessionID) ??
+    trimSessionId(p.sessionId) ??
+    trimSessionId(
+      typeof p.aggregateID === "string" && p.aggregateID.startsWith("ses") ? p.aggregateID : undefined,
+    )
+  if (top) return top
+  const data = p.data
+  if (data && typeof data === "object") {
+    const d = data as Record<string, unknown>
+    const inner = trimSessionId(d.sessionID) ?? trimSessionId(d.sessionId)
+    if (inner) return inner
+  }
+  const nested = p.session
+  if (nested && typeof nested === "object") {
+    const s = nested as Record<string, unknown>
+    if (typeof s.id === "string" && s.id.trim()) return s.id.trim()
+  }
+  return
+}
+
+/** Safe single path segment for `llm-event-logger-<this>.jsonl`. */
+function sessionKeyForFilename(sessionID: string | undefined, properties: unknown): string {
+  const raw = sessionID?.trim() || extractSessionIdFromProperties(properties)
+  if (!raw) return GLOBAL_SESSION_FILE_KEY
+  const cleaned = raw.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^\.+/, "").slice(0, 240)
+  return cleaned || GLOBAL_SESSION_FILE_KEY
+}
 
 /**
  * Event Logger Plugin Configuration
@@ -31,10 +83,24 @@ export interface EventLoggerConfig {
 }
 
 /**
+ * All log lines use local time: yyyyMMdd HH:mm:ss
+ */
+function formatLogTimestamp(ms: number): string {
+  const d = new Date(ms)
+  const y = d.getFullYear()
+  const mo = String(d.getMonth() + 1).padStart(2, "0")
+  const day = String(d.getDate()).padStart(2, "0")
+  const h = String(d.getHours()).padStart(2, "0")
+  const mi = String(d.getMinutes()).padStart(2, "0")
+  const s = String(d.getSeconds()).padStart(2, "0")
+  return `${y}${mo}${day} ${h}:${mi}:${s}`
+}
+
+/**
  * Event log entry structure
  */
 interface EventLogEntry {
-  timestamp: number
+  timestamp: string
   type: string
   source: "bus" | "hook"
   properties: unknown
@@ -46,11 +112,19 @@ interface EventLogEntry {
  */
 class LogBuffer {
   private buffer: EventLogEntry[] = []
-  private readonly maxSize = 100
+  private readonly maxSize = 50
   private flushTimer?: NodeJS.Timeout
-  private readonly flushInterval = 5000 // 5 seconds
+  private readonly flushInterval = 1000
+  private readonly logDir: string
+  private readonly format: string
+  /** Sanitized session id (or `global`) — one file per key: llm-event-logger-<key>.jsonl */
+  private readonly sessionFileKey: string
 
-  constructor(private readonly logDir: string, private readonly format: string) {}
+  constructor(logDir: string, format: string, sessionFileKey: string) {
+    this.logDir = logDir
+    this.format = format
+    this.sessionFileKey = sessionFileKey
+  }
 
   async add(entry: EventLogEntry): Promise<void> {
     this.buffer.push(entry)
@@ -82,8 +156,7 @@ class LogBuffer {
 
   private async writeEntries(entries: EventLogEntry[]): Promise<void> {
     try {
-      const today = new Date().toISOString().split("T")[0]
-      const logFile = path.join(this.logDir, `llm-event-logger-${today}.jsonl`)
+      const logFile = path.join(this.logDir, `llm-event-logger-${this.sessionFileKey}.jsonl`)
       
       const lines = entries
         .map((entry) => JSON.stringify(entry))
@@ -91,7 +164,7 @@ class LogBuffer {
 
       await fs.appendFile(logFile, lines, "utf-8")
     } catch (error) {
-      log.error("Failed to write event log", { error, count: entries.length })
+      pluginLog.error("Failed to write event log", { error, count: entries.length })
     }
   }
 }
@@ -102,12 +175,15 @@ class LogBuffer {
 class LogCleanup {
   private cleanupTimer?: NodeJS.Timeout
   private readonly cleanupInterval = 24 * 60 * 60 * 1000 // 24 hours
+  private readonly logDir: string
+  private readonly retentionDays: number
+  private readonly maxSizeMB: number
 
-  constructor(
-    private readonly logDir: string,
-    private readonly retentionDays: number,
-    private readonly maxSizeMB: number,
-  ) {}
+  constructor(logDir: string, retentionDays: number, maxSizeMB: number) {
+    this.logDir = logDir
+    this.retentionDays = retentionDays
+    this.maxSizeMB = maxSizeMB
+  }
 
   start(): void {
     // Run cleanup on start
@@ -131,7 +207,7 @@ class LogCleanup {
       await this.cleanupByAge()
       await this.cleanupBySize()
     } catch (error) {
-      log.error("Log cleanup failed", { error })
+      pluginLog.error("Log cleanup failed", { error })
     }
   }
 
@@ -143,7 +219,7 @@ class LogCleanup {
       const stats = statSync(file)
       if (stats.mtimeMs < cutoffTime) {
         await fs.unlink(file)
-        log.info("Deleted old log file", { file, reason: "age" })
+        pluginLog.info("Deleted old log file", { file, reason: "age" })
       }
     }
   }
@@ -172,7 +248,7 @@ class LogCleanup {
         const stats = statSync(file)
         await fs.unlink(file)
         totalSize -= stats.size
-        log.info("Deleted log file", { file, reason: "size" })
+        pluginLog.info("Deleted log file", { file, reason: "size" })
       }
     }
   }
@@ -203,7 +279,7 @@ export const EventLoggerPlugin = async (
     level: options?.level ?? "DEBUG",
     output: {
       format: options?.output?.format ?? "json",
-      directory: options?.output?.directory ?? path.join(Global.Path.data, "logs", "llm-event-logger"),
+      directory: options?.output?.directory ?? path.join(defaultOpencodeDataDir(), "logs", "llm-event-logger"),
     },
     retention: {
       days: options?.retention?.days ?? 30,
@@ -216,15 +292,30 @@ export const EventLoggerPlugin = async (
   const logDir = config.output!.directory!
   await fs.mkdir(logDir, { recursive: true }).catch(() => {})
 
-  log.info("Event logger plugin initialized", { 
+  pluginLog.info("Event logger plugin initialized", {
     level: config.level,
     directory: logDir,
     retentionDays: config.retention!.days,
     maxSizeMB: config.retention!.maxSizeMB,
   })
 
-  const buffer = new LogBuffer(logDir, config.output!.format!)
-  
+  const buffers = new Map<string, LogBuffer>()
+  function bufferForSession(sessionFileKey: string): LogBuffer {
+    const hit = buffers.get(sessionFileKey)
+    if (hit) return hit
+    const next = new LogBuffer(logDir, config.output!.format!, sessionFileKey)
+    buffers.set(sessionFileKey, next)
+    return next
+  }
+
+  async function flushAllBuffers() {
+    await Promise.all([...buffers.values()].map((b) => b.flush()))
+  }
+  const drain = () => {
+    void flushAllBuffers()
+  }
+  process.once("beforeExit", drain)
+
   // Start log cleanup manager
   const cleanup = new LogCleanup(
     logDir,
@@ -270,14 +361,15 @@ export const EventLoggerPlugin = async (
     if (!shouldLog(type)) return
 
     const entry: EventLogEntry = {
-      timestamp: Date.now(),
+      timestamp: formatLogTimestamp(Date.now()),
       type,
       source,
       properties,
       sessionID,
     }
 
-    await buffer.add(entry)
+    const key = sessionKeyForFilename(sessionID, properties)
+    await bufferForSession(key).add(entry)
   }
 
   return {
@@ -285,7 +377,8 @@ export const EventLoggerPlugin = async (
      * Monitor all Bus events
      */
     async event({ event }) {
-      await logEvent(event.type, "bus", event.properties)
+      const sid = extractSessionIdFromProperties(event.properties)
+      await logEvent(event.type, "bus", event.properties, sid)
     },
 
     /**

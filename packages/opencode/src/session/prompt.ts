@@ -955,14 +955,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               },
             }
             yield* sessions.updatePart(part)
-            if (Flag.OPENCODE_EXPERIMENTAL_EVENT_SYSTEM) {
-              yield* sync.run(SessionEvent.Shell.Started.Sync, {
-                sessionID: input.sessionID,
-                timestamp: DateTime.makeUnsafe(started),
-                callID,
-                command: input.command,
-              })
-            }
+            yield* sync.run(SessionEvent.Shell.Started.Sync, {
+              sessionID: input.sessionID,
+              timestamp: DateTime.makeUnsafe(started),
+              callID,
+              command: input.command,
+            })
             return { msg, part, cwd: ctx.directory }
           }).pipe(Effect.ensuring(markReady))
 
@@ -978,14 +976,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 output += "\n\n" + ["<metadata>", "User aborted the command", "</metadata>"].join("\n")
               }
               const completed = Date.now()
-              if (Flag.OPENCODE_EXPERIMENTAL_EVENT_SYSTEM) {
-                yield* sync.run(SessionEvent.Shell.Ended.Sync, {
-                  sessionID: input.sessionID,
-                  timestamp: DateTime.makeUnsafe(completed),
-                  callID: part.callID,
-                  output,
-                })
-              }
+              yield* sync.run(SessionEvent.Shell.Ended.Sync, {
+                sessionID: input.sessionID,
+                timestamp: DateTime.makeUnsafe(completed),
+                callID: part.callID,
+                output,
+              })
               if (!msg.time.completed) {
                 msg.time.completed = completed
                 yield* sessions.updateMessage(msg)
@@ -1568,28 +1564,22 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           synthetic: [] as string[],
         },
       )
-      // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
-      if (Flag.OPENCODE_EXPERIMENTAL_EVENT_SYSTEM) {
-        yield* sync.run(SessionEvent.Prompted.Sync, {
+      yield* sync.run(SessionEvent.Prompted.Sync, {
+        sessionID: input.sessionID,
+        timestamp: DateTime.makeUnsafe(info.time.created),
+        prompt: {
+          text: nextPrompt.text.join("\n"),
+          files: nextPrompt.files,
+          agents: nextPrompt.agents,
+          references: nextPrompt.references,
+        },
+      })
+      for (const text of nextPrompt.synthetic) {
+        yield* sync.run(SessionEvent.Synthetic.Sync, {
           sessionID: input.sessionID,
           timestamp: DateTime.makeUnsafe(info.time.created),
-          prompt: {
-            text: nextPrompt.text.join("\n"),
-            files: nextPrompt.files,
-            agents: nextPrompt.agents,
-            references: nextPrompt.references,
-          },
+          text,
         })
-      }
-      for (const text of nextPrompt.synthetic) {
-        // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
-        if (Flag.OPENCODE_EXPERIMENTAL_EVENT_SYSTEM) {
-          yield* sync.run(SessionEvent.Synthetic.Sync, {
-            sessionID: input.sessionID,
-            timestamp: DateTime.makeUnsafe(info.time.created),
-            text,
-          })
-        }
       }
 
       return { info, parts }

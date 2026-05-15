@@ -13,7 +13,7 @@
       {
         "level": "DEBUG",
         "output": {
-          "directory": "/Users/yangzhao/08_opensrc/opencode/.opencode/logs/llm-event-logger",
+          "directory": "/Users/yangzhao/.local/share/opencode/logs/llm-event-logger",
           "format": "json",
         },
         "retention": {

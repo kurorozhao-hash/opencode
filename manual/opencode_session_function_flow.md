@@ -202,9 +202,98 @@ const prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> =
 | 类型 | 说明 | 处理方式 |
 |------|------|----------|
 | file | 文件附件 | 读取文件内容，编码为 base64 |
-| agent | 智能体调用 | 添加调用提示和上下文 |
+| agent | 智能体调用 | 保留原始 agent 部分 + 合成指令文本，引导 LLM 调用 task 工具委派给子智能体 |
 | text | 文本内容 | 直接使用 |
-| subtask | 子任务 | 创建任务描述 |
+| subtask | 子任务 | 直接保留原始部分，用于标题生成等场景 |
+
+**各部分类型详细说明**:
+
+#### Agent 部分（智能体调用）
+
+**数据结构**（`MessageV2.AgentPart`，位于 `message-v2.ts:170`）:
+
+```typescript
+{
+  type: "agent",
+  name: string,          // 智能体名称，如 "code"
+  source?: {             // 可选，引用在原文中的位置
+    value: string,
+    start: number,
+    end: number,
+  }
+}
+```
+
+**`resolvePart` 处理逻辑**（`prompt.ts:1436-1452`）:
+
+```typescript
+if (part.type === "agent") {
+  const perm = Permission.evaluate("task", part.name, ag.permission)
+  const hint = perm.action === "deny" ? " . Invoked by user; guaranteed to exist." : ""
+  return [
+    { ...part, messageID: info.id, sessionID: input.sessionID },  // 保留原始 agent 部分
+    {
+      messageID: info.id,
+      sessionID: input.sessionID,
+      type: "text",
+      synthetic: true,
+      text: " Use the above message and context to generate a prompt and call the task tool with subagent: " + part.name + hint
+    }
+  ]
+}
+```
+
+**处理结果**: 解析后产生两个部分：
+1. `{ type: "agent", name: "code" }` — 原始 agent 引用
+2. `{ type: "text", synthetic: true, text: "Use the above message and context to generate a prompt and call the task tool with subagent: code" }` — **合成的指令文本**，告诉 LLM 应当调用 `task` 工具并以 `code` 作为 subagent 来处理
+
+**举例**: 用户在对话中通过 `@code` 引用了 code 智能体，输入内容为 "帮我重构这个函数 @code"，解析后：
+- 原始 agent 引用被保留
+- 额外生成合成文本指令，引导 LLM 在后续对话循环中通过 tool-call 机制调用 `task` 工具来委派给 `code` 子智能体
+
+**本质**: agent 部分不是直接调用另一个智能体，而是**生成一段合成文本指令**，让当前 LLM 在后续对话循环中通过 tool-call 机制调用 `task` 工具来委派给子智能体。
+
+#### Subtask 部分（子任务）
+
+**数据结构**（`MessageV2.SubtaskPart`，位于 `message-v2.ts:193`）:
+
+```typescript
+{
+  type: "subtask",
+  prompt: string,        // 子任务的具体指令，如 "修复 src/utils.ts 中的类型错误"
+  description: string,   // 子任务描述，如 "修复类型错误"
+  agent: string,         // 执行该子任务的智能体名称，如 "code"
+  model?: {              // 可选的模型指定
+    providerID: string,
+    modelID: string,
+  },
+  command?: string,      // 可选的命令
+}
+```
+
+**`resolvePart` 处理逻辑**: subtask 部分在 `resolvePart` 中走默认分支，直接保留原始部分：
+
+```typescript
+return [{ ...part, messageID: info.id, sessionID: input.sessionID }]
+```
+
+**主要用途**: subtask 部分主要用于**会话标题生成**（`prompt.ts:337-348`）。当检测到用户消息只包含 subtask 时，会直接用 `subtask.prompt` 拼接作为标题生成的输入，而非走完整的消息转换流程：
+
+```typescript
+const subtasks = firstUser.parts.filter((p): p is MessageV2.SubtaskPart => p.type === "subtask")
+const onlySubtasks = subtasks.length > 0 && firstUser.parts.every((p) => p.type === "subtask")
+const msgs = onlySubtasks
+  ? [{ role: "user" as const, content: subtasks.map((p) => p.prompt).join("\n") }]
+  : yield* MessageV2.toModelMessagesEffect(context, mdl)
+```
+
+**举例**: 当主智能体通过 `task` 工具创建子任务时，子任务消息包含：
+- `prompt`: "修复 src/utils.ts 中的类型错误"
+- `description`: "修复类型错误"
+- `agent`: "code"
+- `model`: 可选，如 `{ providerID: "anthropic", modelID: "claude-sonnet-4" }`
+
+**本质**: subtask 是结构化的任务描述信息，由主智能体创建，携带任务指令、描述、执行智能体等元数据，供后续处理（如标题生成、任务分发）使用。
 
 ---
 
@@ -227,10 +316,80 @@ const loop: (input: LoopInput) => Effect.Effect<MessageV2.WithParts> =
   })
 ```
 
-**state.ensureRunning() 的作用**:
-- 确保会话正在运行
-- 处理中断和取消
-- 管理并发访问
+**state.ensureRunning() 详解**:
+
+`ensureRunning` 是基于**有限状态机**的单次调度机制，**不是轮询/定时器**。它通过 `Runner`（位于 `effect/runner.ts`）实现，内部用 `SynchronizedRef` 管理四种状态：
+
+| 状态 | 含义 |
+|------|------|
+| `Idle` | 空闲，无任务运行 |
+| `Running` | 有 `runLoop` 正在执行 |
+| `Shell` | 有 Shell 任务在执行 |
+| `ShellThenRun` | Shell 在执行，但已有 `runLoop` 在排队等待 |
+
+**状态转换与行为**（`runner.ts:115-138`）:
+
+```typescript
+const ensureRunning = (work: Effect.Effect<A, E>) =>
+  SynchronizedRef.modifyEffect(ref, Effect.fnUntraced(function* (st) {
+    switch (st._tag) {
+      case "Running":
+      case "ShellThenRun":
+        // 已有 runLoop 在跑 → 不重复启动，异步等待当前 runLoop 完成
+        return [awaitDone(st.run.done), st] as const
+      case "Shell": {
+        // Shell 在执行 → 将 runLoop 排队，等 Shell 结束后自动启动
+        const run = { id: next(), done: yield* Deferred.make(), work } satisfies PendingHandle
+        return [awaitDone(run.done), { _tag: "ShellThenRun", shell: st.shell, run }] as const
+      }
+      case "Idle": {
+        // 空闲 → 立即启动 runLoop
+        const done = yield* Deferred.make<A, E | Cancelled>()
+        const run = yield* startRun(work, done)
+        return [awaitDone(done), { _tag: "Running", run }] as const
+      }
+    }
+  })).pipe(Effect.flatten)
+```
+
+**各状态下的行为详解**:
+
+1. **`Idle`（空闲）**: 立即通过 `startRun` 将 `runLoop` 作为一个 fiber fork 出去执行，状态转为 `Running`，通过 `Deferred.await(done)` 等待结果
+
+2. **`Running`（已有任务在跑）**: **不会执行新的 `runLoop`**，传入的 `work` 被完全忽略。只做一件事：`awaitDone(st.run.done)`，即 `Deferred.await` 异步挂起当前 fiber，等待正在运行的 `runLoop` 完成后恢复，并返回其结果。这是 Effect 语义下的异步挂起（不阻塞线程），基于 `Deferred` 的一次性通知机制
+
+3. **`Shell`（Shell 在执行）**: 将 `runLoop` 排队为 `PendingHandle`，状态转为 `ShellThenRun`，等 Shell 完成后自动启动 `runLoop`
+
+4. **`ShellThenRun`**: 同 `Running`，等待已排队的 `runLoop` 完成
+
+**为什么 `Running` 状态下不需要启动新的 `runLoop`？**
+
+因为 `runLoop` 内部是 `while(true)` 循环，每次迭代都会重新读取消息历史。如果用户快速连续发送两条消息：
+- 第一条消息触发 `ensureRunning`，状态 `Idle` → 启动 `runLoop` → `Running`
+- 第二条消息触发 `ensureRunning`，状态 `Running` → 不启动新 `runLoop`，等待当前的完成
+- 当前正在跑的 `runLoop` 在下一次循环迭代时会读取到第二条用户消息，自然就会处理它
+
+**`ensureRunning` 的语义**: "确保有一个 `runLoop` 在跑"，而不是"启动一个新的 `runLoop`"。
+
+**取消处理**: 如果当前 `runLoop` 被取消（`Cancelled`），`awaitDone` 会走 `onInterrupt` 分支，即返回 `lastAssistant(sessionID)` 作为 fallback 结果。
+
+**完整流程图**:
+
+```
+prompt() → loop() → ensureRunning(sessionID, fallback, runLoop(sessionID))
+                                    ↓
+                            Runner 状态机判断
+                                    ↓
+                       Idle → fork runLoop fiber → Running
+                                    ↓
+                          runLoop 内部 while(true)
+                            ├─ 调用 LLM
+                            ├─ 处理工具调用
+                            ├─ finish=stop → break 退出
+                            └─ finish=tool-calls → continue 循环
+                                    ↓
+                          运行结束 → finishRun() → Deferred.done() → Idle
+```
 
 ---
 

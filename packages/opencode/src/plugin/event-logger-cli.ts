@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import fs from "fs/promises"
 import path from "path"
-import { createReadStream } from "fs"
+import { createReadStream, statSync } from "fs"
 import { createInterface } from "readline"
 import { Global } from "@opencode-ai/core/global"
 
@@ -31,10 +31,28 @@ interface QueryOptions {
 }
 
 interface EventEntry {
-  timestamp: number
+  /** Local time yyyyMMdd HH:mm:ss (new); legacy logs may use epoch ms number. */
+  timestamp: string | number
   type: string
   properties: unknown
   sessionID?: string
+}
+
+const LOG_TIMESTAMP_RE = /^(\d{4})(\d{2})(\d{2}) (\d{2}):(\d{2}):(\d{2})$/
+
+/** Milliseconds for range filters; NaN if unreadable. */
+function entryTimeMs(entry: EventEntry): number {
+  if (typeof entry.timestamp === "number" && Number.isFinite(entry.timestamp)) return entry.timestamp
+  if (typeof entry.timestamp !== "string") return NaN
+  const m = LOG_TIMESTAMP_RE.exec(entry.timestamp.trim())
+  if (!m) return NaN
+  const y = Number(m[1])
+  const mo = Number(m[2])
+  const d = Number(m[3])
+  const h = Number(m[4])
+  const mi = Number(m[5])
+  const s = Number(m[6])
+  return new Date(y, mo - 1, d, h, mi, s).getTime()
 }
 
 interface EventStats {
@@ -134,23 +152,20 @@ function matchPattern(text: string, pattern: string): boolean {
 }
 
 /**
- * Get log files in date range
+ * Get log files; optional start/end filter uses file mtime (works for per-session filenames).
  */
 async function getLogFiles(logDir: string, start?: Date, end?: Date): Promise<string[]> {
   const files = await fs.readdir(logDir)
-  
+
   return files
     .filter((f) => f.startsWith("llm-event-logger-") && f.endsWith(".jsonl"))
     .map((f) => path.join(logDir, f))
     .filter((f) => {
-      const match = f.match(/llm-event-logger-(\d{4}-\d{2}-\d{2})\.jsonl$/)
-      if (!match) return false
-
-      const fileDate = new Date(match[1])
-      
-      if (start && fileDate < start) return false
-      if (end && fileDate > end) return false
-      
+      if (!start && !end) return true
+      const stats = statSync(f)
+      const m = stats.mtime
+      if (start && m < start) return false
+      if (end && m > end) return false
       return true
     })
     .sort()
@@ -172,10 +187,17 @@ async function* readEvents(files: string[], options: QueryOptions): AsyncGenerat
 
       try {
         const entry: EventEntry = JSON.parse(line)
+        const t = entryTimeMs(entry)
 
         // Apply filters
-        if (options.start && entry.timestamp < options.start.getTime()) continue
-        if (options.end && entry.timestamp > options.end.getTime()) continue
+        if (options.start) {
+          if (Number.isNaN(t)) continue
+          if (t < options.start.getTime()) continue
+        }
+        if (options.end) {
+          if (Number.isNaN(t)) continue
+          if (t > options.end.getTime()) continue
+        }
         if (options.type && !matchPattern(entry.type, options.type)) continue
         if (options.sessionID && entry.sessionID !== options.sessionID) continue
 
@@ -219,8 +241,11 @@ async function showStats(files: string[], options: QueryOptions): Promise<void> 
       stats.errors++
     }
 
-    stats.timeRange.start = Math.min(stats.timeRange.start, event.timestamp)
-    stats.timeRange.end = Math.max(stats.timeRange.end, event.timestamp)
+    const t = entryTimeMs(event)
+    if (!Number.isNaN(t)) {
+      stats.timeRange.start = Math.min(stats.timeRange.start, t)
+      stats.timeRange.end = Math.max(stats.timeRange.end, t)
+    }
   }
 
   console.log("\n=== Event Log Statistics ===\n")
@@ -264,7 +289,8 @@ async function showEvents(files: string[], options: QueryOptions): Promise<void>
   console.log(`\n=== Last ${displayEvents.length} Events ===\n`)
 
   for (const event of displayEvents) {
-    const timestamp = new Date(event.timestamp).toISOString()
+    const timestamp =
+      typeof event.timestamp === "string" ? event.timestamp : new Date(event.timestamp).toISOString()
     console.log(`[${timestamp}] ${event.type}`)
     if (event.sessionID) {
       console.log(`  Session: ${event.sessionID}`)

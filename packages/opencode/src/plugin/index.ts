@@ -245,9 +245,16 @@ export const layer = Layer.effect(
         // Subscribe to bus events, fiber interrupted when scope closes
         yield* bus.subscribeAll().pipe(
           Stream.runForEach((input) =>
-            Effect.sync(() => {
+            Effect.gen(function* () {
               for (const hook of hooks) {
-                void hook["event"]?.({ event: input as any })
+                const fn = hook["event"]
+                if (!fn) continue
+                yield* Effect.tryPromise({
+                  try: () => Promise.resolve(fn({ event: input as any })),
+                  catch: (err) => {
+                    log.error("plugin event hook failed", { error: err })
+                  },
+                }).pipe(Effect.ignore)
               }
             }),
           ),
