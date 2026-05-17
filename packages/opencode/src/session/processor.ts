@@ -221,7 +221,24 @@ export const layer: Layer.Layer<
         return true
       })
 
+      const triggerStreamEvent = Effect.fnUntraced(function* (event: StreamEvent) {
+        yield* plugin.trigger(
+          "experimental.chat.handle_event",
+          {
+            sessionID: ctx.sessionID,
+            messageID: ctx.assistantMessage.id,
+            agent: ctx.assistantMessage.agent,
+            model: {
+              providerID: ctx.model.providerID,
+              modelID: ctx.model.id,
+            },
+          },
+          { type: event.type, value: event },
+        )
+      })
+
       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
+        yield* triggerStreamEvent(value)
         switch (value.type) {
           case "start":
             yield* status.set(ctx.sessionID, { type: "busy" })
@@ -711,6 +728,20 @@ export const layer: Layer.Layer<
         slog.info("process")
         ctx.needsCompaction = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
+
+        yield* plugin.trigger(
+          "experimental.chat.stream_input",
+          {
+            sessionID: ctx.sessionID,
+            messageID: ctx.assistantMessage.id,
+            agent: streamInput.agent.name,
+            model: {
+              providerID: streamInput.model.providerID,
+              modelID: streamInput.model.id,
+            },
+          },
+          { streamInput },
+        )
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {

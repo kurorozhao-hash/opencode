@@ -287,6 +287,35 @@ export interface Hooks {
       }[]
     },
   ) => Promise<void>
+  "experimental.chat.stream_input"?: (
+    input: {
+      sessionID: string
+      messageID: string
+      agent: string
+      model: { providerID: string; modelID: string }
+    },
+    output: {
+      streamInput: {
+        system: string[]
+        messages: unknown[]
+        toolChoice?: "auto" | "required" | "none"
+        small?: boolean
+        retries?: number
+      }
+    },
+  ) => Promise<void>
+  "experimental.chat.handle_event"?: (
+    input: {
+      sessionID: string
+      messageID: string
+      agent: string
+      model: { providerID: string; modelID: string }
+    },
+    output: {
+      type: string
+      value: unknown
+    },
+  ) => Promise<void>
   "experimental.chat.system.transform"?: (
     input: { sessionID?: string; model: Model },
     output: {

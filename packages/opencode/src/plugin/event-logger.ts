@@ -503,6 +503,39 @@ export const EventLoggerPlugin = async (
     },
 
     /**
+     * Monitor LLM stream input payload
+     */
+    async "experimental.chat.stream_input"(input, output) {
+      await logEvent("experimental.chat.stream_input", "hook", {
+        sessionID: input.sessionID,
+        messageID: input.messageID,
+        agent: input.agent,
+        model: input.model,
+        systemLength: output.streamInput.system?.length,
+        messageCount: output.streamInput.messages?.length,
+        toolChoice: output.streamInput.toolChoice,
+        small: output.streamInput.small,
+        retries: output.streamInput.retries,
+        streamInput: config.level === "DEBUG" ? output.streamInput : undefined,
+      }, input.sessionID)
+    },
+
+    /**
+     * Monitor raw LLM stream events
+     */
+    async "experimental.chat.handle_event"(input, output) {
+      await logEvent("experimental.chat.handle_event", "hook", {
+        sessionID: input.sessionID,
+        messageID: input.messageID,
+        agent: input.agent,
+        model: input.model,
+        // Explicitly keep event.type for query and debugging
+        eventType: output.type,
+        event: output.value,
+      }, input.sessionID)
+    },
+
+    /**
      * Monitor system prompt transformations
      */
     async "experimental.chat.system.transform"(input, output) {
